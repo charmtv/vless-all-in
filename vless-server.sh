@@ -12,12 +12,9 @@
 #  插件支持: Snell v4/v5 和 SS2022 可选启用 ShadowTLS
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
-#  
-#  作者: 米粒
 #═══════════════════════════════════════════════════════════════════════════════
 
 readonly VERSION="3.5.3"
-readonly AUTHOR="米粒"
 readonly SHORTCUT_CMD="ml"
 readonly SCRIPT_REPO="charmtv/mlnbvless-all-in"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/vless-server.sh"
@@ -4385,7 +4382,7 @@ _header() {
     clear; echo "" >&2
     _dline
     echo -e "      ${W}多协议代理${NC} ${D}一键部署${NC} ${C}v${VERSION}${NC} ${Y}[服务端]${NC}" >&2
-    echo -e "      ${D}作者: ${AUTHOR}  快捷命令: ${SHORTCUT_CMD}${NC}" >&2
+    echo -e "      ${D}快捷命令: ${SHORTCUT_CMD}${NC}" >&2
     _dline
 }
 
