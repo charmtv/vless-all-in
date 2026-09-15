@@ -1,10 +1,10 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.3 [服务端]
+#  多协议代理一键部署脚本 v3.6.0 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
-#    • Sing-box 核心: 处理 UDP/QUIC 协议 (Hysteria2/TUIC) - 低内存高效率
+#    • Sing-box 核心: 处理 Hysteria2/TUIC/AnyTLS - 低内存高效率
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
@@ -14,12 +14,13 @@
 #  
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.3"
+readonly VERSION="3.6.0"
 readonly SHORTCUT_CMD="ml"
 readonly SCRIPT_REPO="charmtv/mlnbvless-all-in"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/vless-server.sh"
+readonly SCRIPT_CHECKSUM_URL="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/SHA256SUMS"
 readonly CFG="/etc/vless-reality"
-readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
+readonly ACME_DEFAULT_EMAIL="${ACME_EMAIL:-}"
 
 # curl 超时常量
 readonly CURL_TIMEOUT_FAST=5
@@ -49,22 +50,59 @@ _pgrep() {
 #  全局状态数据库 (JSON)
 #═══════════════════════════════════════════════════════════════════════════════
 readonly DB_FILE="$CFG/db.json"
+readonly STATE_LOCK_FILE="$CFG/.state.lock"
+
+# 对会修改配置的顶层操作加进程锁，避免菜单与 cron 同时改写数据库。
+_run_with_state_lock() {
+    local action="$1"
+    shift
+
+    if ! command -v flock >/dev/null 2>&1; then
+        "$action" "$@"
+        return $?
+    fi
+
+    mkdir -p "$CFG" || return 1
+    local lock_fd rc
+    exec {lock_fd}>"$STATE_LOCK_FILE" || return 1
+    if ! flock -w 30 "$lock_fd"; then
+        echo "配置正在被另一个任务修改，请稍后重试" >&2
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    "$action" "$@"
+    rc=$?
+    flock -u "$lock_fd" 2>/dev/null || true
+    exec {lock_fd}>&-
+    return "$rc"
+}
+
+_db_new_tmp() {
+    mkdir -p "$CFG" || return 1
+    mktemp "$CFG/.db.json.tmp.XXXXXX"
+}
 
 # 初始化数据库
 init_db() {
     mkdir -p "$CFG" || return 1
-    [[ -f "$DB_FILE" ]] && return 0
+    if [[ -f "$DB_FILE" ]]; then
+        chmod 600 "$DB_FILE" 2>/dev/null || true
+        return 0
+    fi
     local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
-    tmp=$(mktemp) || return 1
+    tmp=$(_db_new_tmp) || return 1
     if jq -n --arg v "4.0.0" --arg t "$now" \
       '{version:$v,xray:{},singbox:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
+        chmod 600 "$tmp"
         mv "$tmp" "$DB_FILE"
         return 0
     fi
     # jq 失败时使用简单方式创建
     echo '{"version":"4.0.0","xray":{},"singbox":{},"meta":{}}' > "$DB_FILE"
+    chmod 600 "$DB_FILE"
     rm -f "$tmp"
     return 0
 }
@@ -75,8 +113,9 @@ _db_touch() {
     local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
-    tmp=$(mktemp) || return 1
+    tmp=$(_db_new_tmp) || return 1
     if jq --arg t "$now" '.meta.updated=$t' "$DB_FILE" >"$tmp"; then
+        chmod 600 "$tmp"
         mv "$tmp" "$DB_FILE"
     else
         rm -f "$tmp"
@@ -86,8 +125,9 @@ _db_touch() {
 
 _db_apply() { # _db_apply [jq args...] 'filter'
     [[ -f "$DB_FILE" ]] || init_db || return 1
-    local tmp; tmp=$(mktemp) || return 1
+    local tmp; tmp=$(_db_new_tmp) || return 1
     if jq "$@" "$DB_FILE" >"$tmp" 2>/dev/null; then
+        chmod 600 "$tmp"
         mv "$tmp" "$DB_FILE"
         _db_touch
         return 0
@@ -195,7 +235,7 @@ db_add_port() {
         return 0
     fi
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     
     jq --arg c "$core" --arg p "$protocol" --argjson cfg "$port_config" '
         .[$c][$p] = (
@@ -218,7 +258,7 @@ db_remove_port() {
     local core="$1" protocol="$2" port="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     
     jq --arg c "$core" --arg p "$protocol" --arg port "$port" '
         .[$c][$p] = (
@@ -245,7 +285,7 @@ db_update_port() {
     local core="$1" protocol="$2" port="$3" new_config="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     
     jq --arg c "$core" --arg p "$protocol" --arg port "$port" --argjson cfg "$new_config" '
         .[$c][$p] = (
@@ -731,7 +771,7 @@ db_add_user() {
     local created=$(date '+%Y-%m-%d')
     
     # 添加用户 (支持多端口数组，包含 expire_date)
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
        --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
         .[$c][$p] as $cfg |
@@ -762,7 +802,7 @@ db_del_user() {
     local core="$1" proto="$2" name="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -901,7 +941,7 @@ db_update_user_traffic() {
     local core="$1" proto="$2" name="$3" bytes="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -918,7 +958,7 @@ db_set_user_traffic() {
     local core="$1" proto="$2" name="$3" bytes="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -946,7 +986,7 @@ db_set_user_quota() {
         quota=$((quota_gb * 1073741824))
     fi
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson q "$quota" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -963,7 +1003,7 @@ db_set_user_enabled() {
     local core="$1" proto="$2" name="$3" enabled="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -1022,7 +1062,7 @@ db_set_user_alert_state() {
     local core="$1" proto="$2" name="$3" field="$4" value="$5"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     
     # 根据值类型选择合适的 jq 参数
     if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
@@ -1057,7 +1097,7 @@ db_set_user_routing() {
     local core="$1" proto="$2" name="$3" routing="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg r "$routing" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -1121,7 +1161,7 @@ db_set_user_expire_date() {
     # 处理特殊值
     [[ "$expire_date" == "never" ]] && expire_date=""
     
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg e "$expire_date" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -1262,16 +1302,13 @@ db_get_expired_users() {
 # 获取 Telegram 配置
 db_get_tg_config() {
     local field="$1"
-    [[ ! -f "$DB_FILE" ]] && return 1
-    jq -r --arg f "$field" '.telegram[$f] // ""' "$DB_FILE" 2>/dev/null
+    tg_get_config "$field"
 }
 
 # 设置 Telegram 配置
 db_set_tg_config() {
     local field="$1" value="$2"
-    [[ ! -f "$DB_FILE" ]] && init_db
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg f "$field" --arg v "$value" '.telegram[$f] = $v' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    tg_set_config "$field" "$value"
 }
 
 # 发送 Telegram 消息
@@ -1572,8 +1609,29 @@ readonly TG_CONFIG_FILE="$CFG/telegram.json"
 
 # 初始化 TG 配置
 init_tg_config() {
-    [[ -f "$TG_CONFIG_FILE" ]] && return 0
-    echo '{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":""}' > "$TG_CONFIG_FILE"
+    if [[ -f "$TG_CONFIG_FILE" ]]; then
+        chmod 600 "$TG_CONFIG_FILE" 2>/dev/null || true
+        return 0
+    fi
+    mkdir -p "$CFG" || return 1
+
+    # 从旧版 db.json.telegram 自动迁移，避免升级后到期提醒与菜单配置不一致。
+    local legacy_token="" legacy_chat_id="" enabled=false tmp
+    if [[ -f "$DB_FILE" ]]; then
+        legacy_token=$(jq -r '.telegram.bot_token // ""' "$DB_FILE" 2>/dev/null)
+        legacy_chat_id=$(jq -r '.telegram.chat_id // ""' "$DB_FILE" 2>/dev/null)
+        [[ -n "$legacy_token" && -n "$legacy_chat_id" ]] && enabled=true
+    fi
+
+    tmp=$(mktemp "$CFG/.telegram.json.tmp.XXXXXX") || return 1
+    if jq -n --arg token "$legacy_token" --arg chat_id "$legacy_chat_id" --argjson enabled "$enabled" \
+        '{enabled:$enabled,bot_token:$token,chat_id:$chat_id,notify_quota_percent:80,notify_daily:false,server_name:""}' > "$tmp"; then
+        chmod 600 "$tmp"
+        mv "$tmp" "$TG_CONFIG_FILE"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # 获取 TG 模板里的服务器显示文本
@@ -1594,7 +1652,7 @@ get_tg_server_display() {
 tg_get_config() {
     local field="$1"
     [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
-    jq -r ".$field // empty" "$TG_CONFIG_FILE" 2>/dev/null
+    jq -r --arg f "$field" '.[$f] // empty' "$TG_CONFIG_FILE" 2>/dev/null
 }
 
 # 设置 TG 配置
@@ -1602,12 +1660,13 @@ tg_set_config() {
     local field="$1" value="$2"
     [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
     
-    local tmp=$(mktemp)
+    local tmp; tmp=$(mktemp "$CFG/.telegram.json.tmp.XXXXXX") || return 1
     if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
         jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
     else
         jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
     fi
+    chmod 600 "$tmp"
     mv "$tmp" "$TG_CONFIG_FILE"
 }
 
@@ -2486,11 +2545,37 @@ _has_master_protocol() {
 
 # 检查证书是否为 CA 签发的真实证书
 _is_real_cert() {
-    [[ ! -f "$CFG/certs/server.crt" ]] && return 1
-    local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-    [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || \
-    [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || \
-    [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]
+    local cert="$CFG/certs/server.crt" domain="" ca_file=""
+    [[ -s "$cert" ]] || return 1
+
+    # 必须未过期且能由系统信任库验证；不再依赖容易遗漏的签发者名称列表。
+    openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    for ca_file in "/etc/ssl/certs/ca-certificates.crt" "/etc/ssl/cert.pem" "/etc/pki/tls/certs/ca-bundle.crt"; do
+        [[ -s "$ca_file" ]] && break
+        ca_file=""
+    done
+    [[ -n "$ca_file" ]] || return 1
+    openssl verify -CAfile "$ca_file" "$cert" >/dev/null 2>&1 || return 1
+
+    domain=$(cat "$CFG/cert_domain" 2>/dev/null)
+    if [[ -n "$domain" ]] && openssl x509 -help 2>&1 | grep -q -- '-checkhost'; then
+        openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+_tls_skip_verify_for_sni() {
+    local sni="$1" cert_domain=""
+    cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
+    if [[ -n "$sni" && "$sni" == "$cert_domain" ]] && _is_real_cert; then
+        echo "false"
+    else
+        echo "true"
+    fi
+}
+
+_tls_insecure_for_sni() {
+    [[ "$(_tls_skip_verify_for_sni "$1")" == "true" ]] && echo "1" || echo "0"
 }
 
 # 确保 Nginx HTTPS 监听存在 (真实域名模式，供 Reality dest 回落)
@@ -2839,7 +2924,7 @@ for _p in $XRAY_PROTOCOLS; do
     PROTO_KIND[$_p]="xray"
 done
 
-# Sing-box 统一服务：hy2/tuic 由 vless-singbox 统一管理
+# Sing-box 统一服务：hy2/tuic/anytls 由 vless-singbox 统一管理
 PROTO_SVC[hy2]="vless-singbox";  PROTO_BIN[hy2]="sing-box"; PROTO_KIND[hy2]="singbox"
 PROTO_SVC[tuic]="vless-singbox"; PROTO_BIN[tuic]="sing-box"; PROTO_KIND[tuic]="singbox"
 PROTO_SVC[anytls]="vless-singbox"; PROTO_BIN[anytls]="sing-box"; PROTO_KIND[anytls]="singbox"
@@ -2849,7 +2934,6 @@ PROTO_SVC[snell]="vless-snell";     PROTO_EXEC[snell]="/usr/local/bin/snell-serv
 PROTO_SVC[snell-v5]="vless-snell-v5"; PROTO_EXEC[snell-v5]="/usr/local/bin/snell-server-v5 -c $CFG/snell-v5.conf"; PROTO_BIN[snell-v5]="snell-server-v5"; PROTO_KIND[snell-v5]="snell"
 
 # 动态命令：运行时从数据库取参数
-PROTO_SVC[anytls]="vless-anytls"; PROTO_KIND[anytls]="anytls"
 PROTO_SVC[naive]="vless-naive"; PROTO_KIND[naive]="naive"
 
 # ShadowTLS：主服务 shadow-tls + 额外 backend 服务
@@ -2877,7 +2961,6 @@ declare -A SVC_PROC=(
     [vless-singbox]="sing-box"
     [vless-snell]="snell-server"
     [vless-snell-v5]="snell-server-v5"
-    [vless-anytls]="anytls-server"
     [vless-naive]="caddy"
     [vless-snell-shadowtls]="shadow-tls"
     [vless-snell-v5-shadowtls]="shadow-tls"
@@ -4456,7 +4539,7 @@ check_dependencies() {
     local need_install=false
     
     # 必需的基础命令
-    local required_cmds="curl jq openssl qrencode"
+    local required_cmds="curl jq openssl qrencode flock"
     
     for cmd in $required_cmds; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -4483,7 +4566,7 @@ check_dependencies() {
             alpine)
                 apk update >/dev/null 2>&1
                 # Alpine 上 qrencode 命令来自 libqrencode-tools，不是 qrencode 包名
-                local alpine_base_pkgs="curl jq openssl coreutils ca-certificates gawk libqrencode-tools"
+                local alpine_base_pkgs="curl jq openssl coreutils ca-certificates gawk libqrencode-tools util-linux"
                 apk add --no-cache $alpine_base_pkgs >/dev/null 2>&1 || {
                     _err "Alpine 基础依赖安装失败"
                     _warn "请手动执行: apk add --no-cache $alpine_base_pkgs"
@@ -4508,14 +4591,14 @@ check_dependencies() {
                 rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
                 ;;
             centos)
-                yum install -y curl jq openssl ca-certificates qrencode cronie >/dev/null 2>&1
+                yum install -y curl jq openssl ca-certificates qrencode cronie util-linux >/dev/null 2>&1
                 # 启动 crond 服务
                 systemctl enable crond >/dev/null 2>&1
                 systemctl start crond >/dev/null 2>&1
                 ;;
             debian|ubuntu)
                 apt-get update >/dev/null 2>&1
-                DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl ca-certificates qrencode cron >/dev/null 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl ca-certificates qrencode cron util-linux >/dev/null 2>&1
                 # Debian/Ubuntu 的 cron 通常自动启动,但确保服务运行
                 if command -v systemctl >/dev/null 2>&1; then
                     systemctl enable cron >/dev/null 2>&1
@@ -4685,13 +4768,13 @@ sync_time() {
 #═══════════════════════════════════════════════════════════════════════════════
 get_ipv4() {
     [[ -n "$_CACHED_IPV4" ]] && { echo "$_CACHED_IPV4"; return; }
-    local result=$(curl -4 -sf --connect-timeout 5 ip.sb 2>/dev/null || curl -4 -sf --connect-timeout 5 ifconfig.me 2>/dev/null)
+    local result=$(curl -4 -sf --connect-timeout 5 https://ip.sb 2>/dev/null || curl -4 -sf --connect-timeout 5 https://ifconfig.me/ip 2>/dev/null)
     [[ -n "$result" ]] && _CACHED_IPV4="$result"
     echo "$result"
 }
 get_ipv6() {
     [[ -n "$_CACHED_IPV6" ]] && { echo "$_CACHED_IPV6"; return; }
-    local result=$(curl -6 -sf --connect-timeout 5 ip.sb 2>/dev/null || curl -6 -sf --connect-timeout 5 ifconfig.me 2>/dev/null)
+    local result=$(curl -6 -sf --connect-timeout 5 https://ip.sb 2>/dev/null || curl -6 -sf --connect-timeout 5 https://ifconfig.me/ip 2>/dev/null)
     [[ -n "$result" ]] && _CACHED_IPV6="$result"
     echo "$result"
 }
@@ -4708,12 +4791,12 @@ get_ip_country() {
         country=$(curl -sf --connect-timeout 3 "https://ipinfo.io/country" 2>/dev/null)
     fi
     
-    # 方法2: 回退到 ip-api.com (免费，无需 key)
+    # 方法2: 回退到支持 HTTPS 的 ipwho.is
     if [[ -z "$country" || "$country" == "fail" ]]; then
         if [[ -n "$ip" ]]; then
-            country=$(curl -sf --connect-timeout 3 "http://ip-api.com/line/${ip}?fields=countryCode" 2>/dev/null)
+            country=$(curl -sf --connect-timeout 3 "https://ipwho.is/${ip}?fields=country_code" 2>/dev/null | jq -r '.country_code // empty')
         else
-            country=$(curl -sf --connect-timeout 3 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null)
+            country=$(curl -sf --connect-timeout 3 "https://ipwho.is/?fields=country_code" 2>/dev/null | jq -r '.country_code // empty')
         fi
     fi
     
@@ -5771,12 +5854,13 @@ gen_vmess_ws_link() {
     local clean_ip="${ip#[}"
     clean_ip="${clean_ip%]}"
     local name=$(build_node_name "$country" "VMess-WS")
+    local skip_verify=$(_tls_skip_verify_for_sni "$sni")
 
     # VMess ws 链接：vmess://base64(json)
     # 注意：allowInsecure 必须是字符串 "true"，不是布尔值
     local json
     json=$(cat <<EOF
-{"v":"2","ps":"${name}","add":"${clean_ip}","port":"${port}","id":"${uuid}","aid":"0","scy":"auto","net":"ws","type":"none","host":"${sni}","path":"${path}","tls":"tls","sni":"${sni}","allowInsecure":"true"}
+    {"v":"2","ps":"${name}","add":"${clean_ip}","port":"${port}","id":"${uuid}","aid":"0","scy":"auto","net":"ws","type":"none","host":"${sni}","path":"${path}","tls":"tls","sni":"${sni}","allowInsecure":"${skip_verify}"}
 EOF
 )
     printf 'vmess://%s\n' "$(echo -n "$json" | base64 -w 0 2>/dev/null || echo -n "$json" | base64 | tr -d '\n')"
@@ -5808,26 +5892,30 @@ _can_gen_qr() {
 gen_hy2_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
     local name=$(build_node_name "$country" "Hysteria2")
+    local insecure=$(_tls_insecure_for_sni "$sni")
     # 链接始终使用实际端口，端口跳跃需要客户端手动配置
-    printf '%s\n' "hysteria2://${password}@${ip}:${port}?sni=${sni}&insecure=1#${name}"
+    printf '%s\n' "hysteria2://${password}@${ip}:${port}?sni=${sni}&insecure=${insecure}#${name}"
 }
 
 gen_trojan_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
     local name=$(build_node_name "$country" "Trojan")
-    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=tcp&allowInsecure=1#${name}"
+    local insecure=$(_tls_insecure_for_sni "$sni")
+    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=tcp&allowInsecure=${insecure}#${name}"
 }
 
 gen_trojan_ws_link() {
     local ip="$1" port="$2" password="$3" sni="$4" path="${5:-/trojan}" country="${6:-}"
     local name=$(build_node_name "$country" "Trojan-WS")
-    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=1#${name}"
+    local insecure=$(_tls_insecure_for_sni "$sni")
+    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=${insecure}#${name}"
 }
 
 gen_vless_ws_link() {
     local ip="$1" port="$2" uuid="$3" sni="$4" path="${5:-/}" country="${6:-}"
     local name=$(build_node_name "$country" "VLESS-WS")
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=1#${name}"
+    local insecure=$(_tls_insecure_for_sni "$sni")
+    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=${insecure}#${name}"
 }
 
 # VLESS-WS (无TLS) 分享链接 - 用于 CF Tunnel
@@ -5843,7 +5931,8 @@ gen_vless_ws_notls_link() {
 gen_vless_vision_link() {
     local ip="$1" port="$2" uuid="$3" sni="$4" country="${5:-}"
     local name=$(build_node_name "$country" "VLESS-Vision")
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=tcp&flow=xtls-rprx-vision&allowInsecure=1#${name}"
+    local insecure=$(_tls_insecure_for_sni "$sni")
+    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=tcp&flow=xtls-rprx-vision&allowInsecure=${insecure}#${name}"
 }
 
 gen_ss2022_link() {
@@ -5870,13 +5959,15 @@ gen_snell_link() {
 gen_tuic_link() {
     local ip="$1" port="$2" uuid="$3" password="$4" sni="$5" country="${6:-}"
     local name=$(build_node_name "$country" "TUIC")
-    printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native&allow_insecure=1#${name}"
+    local insecure=$(_tls_insecure_for_sni "$sni")
+    printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native&allow_insecure=${insecure}#${name}"
 }
 
 gen_anytls_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
     local name=$(build_node_name "$country" "AnyTLS")
-    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=1#${name}"
+    local insecure=$(_tls_insecure_for_sni "$sni")
+    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&insecure=${insecure}#${name}"
 }
 
 gen_naive_link() {
@@ -6059,40 +6150,63 @@ install_acme_tool() {
     done
     
     _info "安装 acme.sh 证书申请工具..."
-    
-    # 方法1: 官方安装脚本
-    if curl -sL https://get.acme.sh | sh -s email="$ACME_DEFAULT_EMAIL" 2>&1 | grep -qE "Install success|already installed"; then
-        source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
-        if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
-            _ok "acme.sh 安装成功"
-            return 0
+
+    # 方法1: 先保存并检查官方安装脚本，避免直接 curl | sh。
+    local installer_tmp install_output
+    installer_tmp=$(mktemp) || return 1
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o "$installer_tmp" https://get.acme.sh \
+        && bash -n "$installer_tmp" >/dev/null 2>&1; then
+        if [[ -n "$ACME_DEFAULT_EMAIL" ]]; then
+            install_output=$(sh "$installer_tmp" "email=$ACME_DEFAULT_EMAIL" 2>&1)
+        else
+            install_output=$(sh "$installer_tmp" 2>&1)
+        fi
+        if echo "$install_output" | grep -qE "Install success|already installed"; then
+            rm -f "$installer_tmp"
+            source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
+            if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
+                _ok "acme.sh 安装成功"
+                return 0
+            fi
         fi
     fi
+    rm -f "$installer_tmp"
     
     # 方法2: 使用 git clone
     if command -v git &>/dev/null; then
         _info "尝试使用 git 安装..."
-        if git clone --depth 1 https://github.com/acmesh-official/acme.sh.git /tmp/acme.sh 2>/dev/null; then
-            cd /tmp/acme.sh && ./acme.sh --install -m "$ACME_DEFAULT_EMAIL" 2>/dev/null
-            cd - >/dev/null
-            rm -rf /tmp/acme.sh
+        local acme_tmp
+        acme_tmp=$(mktemp -d) || return 1
+        if git clone --depth 1 https://github.com/acmesh-official/acme.sh.git "$acme_tmp/repo" 2>/dev/null; then
+            if [[ -n "$ACME_DEFAULT_EMAIL" ]]; then
+                (cd "$acme_tmp/repo" && ./acme.sh --install -m "$ACME_DEFAULT_EMAIL" 2>/dev/null)
+            else
+                (cd "$acme_tmp/repo" && ./acme.sh --install 2>/dev/null)
+            fi
+            rm -rf "$acme_tmp"
             if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
                 _ok "acme.sh 安装成功 (git)"
                 return 0
             fi
         fi
+        rm -rf "$acme_tmp"
     fi
     
     # 方法3: 直接下载脚本
     _info "尝试直接下载..."
     mkdir -p "$HOME/.acme.sh"
-    if curl -sL -o "$HOME/.acme.sh/acme.sh" "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" 2>/dev/null; then
-        chmod +x "$HOME/.acme.sh/acme.sh"
+    local acme_download
+    acme_download=$(mktemp) || return 1
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o "$acme_download" "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" 2>/dev/null \
+        && bash -n "$acme_download" >/dev/null 2>&1; then
+        install -m 700 "$acme_download" "$HOME/.acme.sh/acme.sh"
+        rm -f "$acme_download"
         if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
             _ok "acme.sh 安装成功 (直接下载)"
             return 0
         fi
     fi
+    rm -f "$acme_download"
     
     _err "acme.sh 安装失败，请检查网络连接"
     _warn "你可以手动安装: curl https://get.acme.sh | sh"
@@ -6103,7 +6217,7 @@ install_acme_tool() {
 ensure_acme_account_email() {
     local acme_sh="$1"
     local account_conf="$HOME/.acme.sh/account.conf"
-    local current_email=""
+    local current_email="" account_email="$ACME_DEFAULT_EMAIL"
     
     if [[ -f "$account_conf" ]]; then
         current_email=$(grep -E "^ACCOUNT_EMAIL=" "$account_conf" | head -1 | sed -E "s/^ACCOUNT_EMAIL=['\"]?([^'\"]*)['\"]?$/\1/")
@@ -6111,23 +6225,32 @@ ensure_acme_account_email() {
     
     if [[ -z "$current_email" || "$current_email" == *"example.com"* ]]; then
         echo ""
-        _info "设置 ACME 账户邮箱为默认值: $ACME_DEFAULT_EMAIL"
+        if [[ -z "$account_email" && -r /dev/tty ]]; then
+            read -rp "  请输入接收证书通知的邮箱: " account_email </dev/tty
+        fi
+        if [[ ! "$account_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || [[ "$account_email" == *"example.com"* ]]; then
+            _err "需要有效的 ACME 邮箱；也可通过 ACME_EMAIL 环境变量提供"
+            return 1
+        fi
+
+        _info "设置 ACME 账户邮箱: $account_email"
         if [[ -f "$account_conf" ]]; then
             if grep -q "^ACCOUNT_EMAIL=" "$account_conf"; then
-                sed -i "s/^ACCOUNT_EMAIL=.*/ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'/" "$account_conf"
+                sed -i "s/^ACCOUNT_EMAIL=.*/ACCOUNT_EMAIL='$account_email'/" "$account_conf"
             else
-                echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" >> "$account_conf"
+                echo "ACCOUNT_EMAIL='$account_email'" >> "$account_conf"
             fi
         else
             mkdir -p "$HOME/.acme.sh"
-            echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" > "$account_conf"
+            echo "ACCOUNT_EMAIL='$account_email'" > "$account_conf"
         fi
+        chmod 600 "$account_conf" 2>/dev/null || true
         
-        if ! ACCOUNT_EMAIL="$ACME_DEFAULT_EMAIL" "$acme_sh" --register-account -m "$ACME_DEFAULT_EMAIL" >/dev/null 2>&1; then
+        if ! ACCOUNT_EMAIL="$account_email" "$acme_sh" --register-account -m "$account_email" >/dev/null 2>&1; then
             _err "ACME 账户注册失败，请检查网络或稍后重试"
             return 1
         fi
-        _ok "ACME 账户邮箱已更新: $ACME_DEFAULT_EMAIL"
+        _ok "ACME 账户邮箱已更新: $account_email"
     fi
     
     return 0
@@ -7092,7 +7215,33 @@ _is_cache_fresh() {
     [[ $age -lt $VERSION_CACHE_TTL ]]
 }
 
-# 下载脚本到临时文件（回显临时文件路径）
+# 计算文件 SHA256（兼容常见发行版）。
+_sha256_file() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$file" | awk '{print $NF}'
+    fi
+}
+
+_verify_script_checksum() {
+    local script_file="$1" sums_file expected actual
+    sums_file=$(mktemp) || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 20 -o "$sums_file" "$SCRIPT_CHECKSUM_URL"; then
+        rm -f "$sums_file"
+        return 1
+    fi
+
+    expected=$(awk '$2 == "vless-server.sh" || $2 == "*vless-server.sh" {print $1; exit}' "$sums_file")
+    actual=$(_sha256_file "$script_file")
+    rm -f "$sums_file"
+    [[ -n "$expected" && "${actual,,}" == "${expected,,}" ]]
+}
+
+# 下载、校验脚本并检查 Bash 语法（回显临时文件路径）
 _fetch_script_tmp() {
     local connect_timeout="${1:-10}"
     local max_time="${2:-}"
@@ -7108,6 +7257,14 @@ _fetch_script_tmp() {
             rm -f "$tmp_file"
             return 1
         fi
+    fi
+    if ! _verify_script_checksum "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if ! bash -n "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        return 1
     fi
     echo "$tmp_file"
 }
@@ -9822,10 +9979,26 @@ generate_singbox_config() {
     return 0
 }
 
+# 清理 3.6.0 之前遗留的独立 AnyTLS 服务；AnyTLS 现由 Sing-box 统一承载。
+cleanup_legacy_anytls_service() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-service vless-anytls stop >/dev/null 2>&1 || true
+        rc-update del vless-anytls default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/vless-anytls
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl stop vless-anytls.service >/dev/null 2>&1 || true
+        systemctl disable vless-anytls.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/vless-anytls.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
 # 创建 Sing-box 服务
 create_singbox_service() {
     local service_name="vless-singbox"
     local exec_cmd="/usr/local/bin/sing-box run -c $CFG/singbox.json"
+
+    cleanup_legacy_anytls_service
     
     # 检查是否有 hy2 协议且启用了端口跳跃
     local has_hy2_hop=false
@@ -9865,7 +10038,7 @@ EOF
         
         cat > /etc/systemd/system/${service_name}.service << EOF
 [Unit]
-Description=Sing-box Proxy Server (Hy2/TUIC/SS2022)
+Description=Sing-box Proxy Server (Hy2/TUIC/AnyTLS)
 After=network.target
 
 [Service]
@@ -9958,18 +10131,6 @@ install_snell_v5() {
         rm -rf "$tmp"; _ok "Snell v$version 已安装"; return 0
     fi
     rm -rf "$tmp"; _err "下载失败"; return 1
-}
-
-# 安装 AnyTLS
-install_anytls() {
-    local aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
-    # Alpine 需要安装 gcompat 兼容层（以防 Go 二进制使用 CGO）
-    if [[ "$DISTRO" == "alpine" ]]; then
-        apk add --no-cache gcompat libc6-compat &>/dev/null
-    fi
-    _install_binary "anytls-server" "anytls/anytls-go" \
-        'https://github.com/anytls/anytls-go/releases/download/v$version/anytls_${version}_linux_${aarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/anytls-server" /usr/local/bin/anytls-server && install -m 755 "$tmp/anytls-client" /usr/local/bin/anytls-client 2>/dev/null'
 }
 
 # 安装 ShadowTLS
@@ -10777,15 +10938,14 @@ get_all_services() {
     local xray_protos=$(jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null)
     [[ -n "$xray_protos" ]] && services+="vless-reality:xray "
     
-    # 检查 Sing-box 协议 (hy2/tuic 由 vless-singbox 统一管理)
+    # 检查 Sing-box 协议 (hy2/tuic/anytls 由 vless-singbox 统一管理)
     local singbox_protos=$(jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null)
     local has_singbox=false
     for proto in $singbox_protos; do
         case "$proto" in
-            hy2|tuic) has_singbox=true ;;
+            hy2|tuic|anytls) has_singbox=true ;;
             snell) services+="vless-snell:snell-server " ;;
             snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
-            anytls) services+="vless-anytls:anytls-server " ;;
             snell-shadowtls) services+="vless-snell-shadowtls:shadow-tls " ;;
             snell-v5-shadowtls) services+="vless-snell-v5-shadowtls:shadow-tls " ;;
             ss2022-shadowtls) services+="vless-ss2022-shadowtls:shadow-tls " ;;
@@ -10934,6 +11094,12 @@ create_service() {
 
     [[ -z "$service_name" ]] && { _err "未知协议: $protocol"; return 1; }
 
+    # Sing-box 协议共享同一个服务，不能再生成旧版的独立 AnyTLS 服务。
+    if [[ "$kind" == "singbox" ]]; then
+        create_singbox_service
+        return $?
+    fi
+
     # 检查配置是否存在（支持 xray 和 singbox 核心）
     _need_cfg() { 
         local proto="$1" name="$2"
@@ -10953,14 +11119,6 @@ create_service() {
     }
 
     case "$kind" in
-        anytls)
-            _need_cfg "anytls" "AnyTLS" || return 1
-            port=$(db_get_field "xray" "anytls" "port")
-            password=$(db_get_field "xray" "anytls" "password")
-            local lh=$(_listen_addr)
-            exec_cmd="/usr/local/bin/anytls-server -l $(_fmt_hostport "$lh" "$port") -p ${password}"
-            exec_name="anytls-server"
-            ;;
         naive)
             _need_cfg "naive" "NaïveProxy" || return 1
             exec_cmd="/usr/local/bin/caddy run --config $CFG/Caddyfile"
@@ -11510,12 +11668,31 @@ download_wgcf() {
     [[ -z "$wgcf_ver" || "$wgcf_ver" == "null" ]] && wgcf_ver="2.2.29"
     echo -e " v${wgcf_ver}"
     
-    # 镜像源列表（优先使用支持 IPv6 的镜像，IPv4 直连放后面备选）
+    local asset_name="wgcf_${wgcf_ver}_linux_${wgcf_arch}"
+    local release_base="https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}"
+    local tmp_dir checksum_file expected_hash
+    tmp_dir=$(mktemp -d) || return 1
+    checksum_file="$tmp_dir/checksums.txt"
+
+    # 校验和只从上游官方 Release 获取；第三方镜像仅用于下载已经有可信哈希的二进制。
+    if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$checksum_file" "$release_base/checksums.txt"; then
+        rm -rf "$tmp_dir"
+        _err "无法获取 wgcf 官方校验和，已取消安装"
+        return 1
+    fi
+    expected_hash=$(awk -v name="$asset_name" '$2 == name || $2 == "*" name {print $1; exit}' "$checksum_file")
+    if [[ -z "$expected_hash" ]]; then
+        rm -rf "$tmp_dir"
+        _err "官方校验文件中未找到 $asset_name"
+        return 1
+    fi
+
+    # 官方源优先，镜像只作为网络受限环境的下载回退。
     local wgcf_urls=(
+        "$release_base/$asset_name"
         "https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://ghps.cc/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://gh.ddlc.top/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
-        "https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://ghproxy.net/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
     )
     
@@ -11523,66 +11700,62 @@ download_wgcf() {
     if [[ ! -d "/usr/local/bin" ]]; then
         echo -e "  ${Y}提示${NC}: /usr/local/bin 目录不存在，正在创建..."
         mkdir -p "/usr/local/bin" 2>/dev/null || {
+            rm -rf "$tmp_dir"
             _err "无法创建 /usr/local/bin 目录（权限不足？）"
             return 1
         }
     fi
     
     if [[ ! -w "/usr/local/bin" ]]; then
+        rm -rf "$tmp_dir"
         _err "/usr/local/bin 目录不可写，请检查权限或使用 sudo"
         return 1
     fi
     
-    # 删除旧文件（如果存在）
-    if [[ -f "/usr/local/bin/wgcf" ]]; then
-        echo -ne "  ${C}▸${NC} 删除旧版本..."
-        if rm -f "/usr/local/bin/wgcf" 2>/dev/null; then
-            echo -e " ${G}✓${NC}"
-        else
-            echo -e " ${R}✗${NC}"
-            _err "无法删除旧文件（权限不足或文件被锁定）"
-            return 1
-        fi
-    fi
-    
     local try_num=1
     local last_error=""
+    local candidate="$tmp_dir/$asset_name"
     for url in "${wgcf_urls[@]}"; do
         echo -e "  ${C}▸${NC} 下载 wgcf (尝试 $try_num/${#wgcf_urls[@]})"
         echo -e "    ${D}地址: $url${NC}"
         
         # 捕获详细错误
-        last_error=$(curl -fsSL -o "/usr/local/bin/wgcf" -A "Mozilla/5.0" --max-redirs 5 --connect-timeout 15 --max-time 90 "$url" 2>&1)
+        last_error=$(curl -fsSL -o "$candidate" -A "Mozilla/5.0" --max-redirs 5 --connect-timeout 15 --max-time 90 "$url" 2>&1)
         local curl_ret=$?
         
         # 详细的验证流程
         if [[ $curl_ret -eq 0 ]]; then
-            if [[ ! -f "/usr/local/bin/wgcf" ]]; then
+            if [[ ! -f "$candidate" ]]; then
                 echo -e "    ${R}✗ 文件未生成${NC}"
-            elif [[ ! -s "/usr/local/bin/wgcf" ]]; then
+            elif [[ ! -s "$candidate" ]]; then
                 echo -e "    ${R}✗ 文件为空${NC}"
-                rm -f "/usr/local/bin/wgcf"
+                rm -f "$candidate"
+            elif [[ "$(_sha256_file "$candidate")" != "$expected_hash" ]]; then
+                echo -e "    ${R}✗ SHA256 校验失败${NC}"
+                rm -f "$candidate"
             elif command -v file &>/dev/null; then
                 # 有 file 命令：完整验证
-                if ! file "/usr/local/bin/wgcf" 2>/dev/null | grep -q "ELF"; then
+                if ! file "$candidate" 2>/dev/null | grep -q "ELF"; then
                     echo -e "    ${R}✗ 文件格式错误（非 ELF 可执行文件）${NC}"
-                    echo -e "    ${D}文件类型: $(file "/usr/local/bin/wgcf" 2>/dev/null)${NC}"
-                    rm -f "/usr/local/bin/wgcf"
+                    echo -e "    ${D}文件类型: $(file "$candidate" 2>/dev/null)${NC}"
+                    rm -f "$candidate"
                 else
-                    chmod +x "/usr/local/bin/wgcf"
-                    echo -e "    ${G}✓ 下载成功${NC}"
+                    install -m 755 "$candidate" /usr/local/bin/wgcf
+                    rm -rf "$tmp_dir"
+                    echo -e "    ${G}✓ 下载并校验成功${NC}"
                     return 0
                 fi
             else
                 # 无 file 命令：降级验证（检查文件大小）
-                local filesize=$(stat -f%z "/usr/local/bin/wgcf" 2>/dev/null || stat -c%s "/usr/local/bin/wgcf" 2>/dev/null)
+                local filesize=$(stat -f%z "$candidate" 2>/dev/null || stat -c%s "$candidate" 2>/dev/null)
                 if [[ $filesize -gt 100000 ]]; then
-                    chmod +x "/usr/local/bin/wgcf"
-                    echo -e "    ${G}✓ 下载成功${NC} ${D}(文件大小: $((filesize/1024))KB)${NC}"
+                    install -m 755 "$candidate" /usr/local/bin/wgcf
+                    rm -rf "$tmp_dir"
+                    echo -e "    ${G}✓ 下载并校验成功${NC} ${D}(文件大小: $((filesize/1024))KB)${NC}"
                     return 0
                 else
                     echo -e "    ${R}✗ 文件大小异常 (${filesize} 字节)${NC}"
-                    rm -f "/usr/local/bin/wgcf"
+                    rm -f "$candidate"
                 fi
             fi
         else
@@ -11590,12 +11763,13 @@ download_wgcf() {
         fi
         
         [[ -n "$last_error" ]] && echo -e "    ${D}错误: $last_error${NC}"
-        rm -f "/usr/local/bin/wgcf"
+        rm -f "$candidate"
         ((try_num++))
         sleep 1
     done
     
     _err "wgcf 下载失败"
+    rm -rf "$tmp_dir"
     echo -e "  ${Y}提示${NC}: 所有镜像源均不可用，可能是网络问题"
     echo -e "  ${Y}手动下载${NC}: https://github.com/ViRb3/wgcf/releases"
     echo -e "  ${Y}下载后${NC}: 将文件上传到 /usr/local/bin/wgcf 并执行 chmod +x"
@@ -11611,19 +11785,22 @@ register_warp() {
         return 1
     fi
     
-    cd /tmp
-    rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf 2>/dev/null
+    local work_dir account_file profile_file
+    work_dir=$(mktemp -d) || { _err "无法创建 WARP 临时目录"; return 1; }
+    account_file="$work_dir/wgcf-account.toml"
+    profile_file="$work_dir/wgcf-profile.conf"
     
     # 注册 WARP 账户
     echo -ne "  ${C}▸${NC} 注册 WARP 账户..."
     local register_output
-    register_output=$(/usr/local/bin/wgcf register --accept-tos 2>&1)
+    register_output=$(cd "$work_dir" && /usr/local/bin/wgcf register --accept-tos 2>&1)
     local register_ret=$?
     
-    if [[ $register_ret -ne 0 ]] || [[ ! -f /tmp/wgcf-account.toml ]]; then
+    if [[ $register_ret -ne 0 ]] || [[ ! -f "$account_file" ]]; then
         echo -e " ${R}✗${NC}"
         _err "WARP 账户注册失败"
         [[ -n "$register_output" ]] && echo -e "  ${D}$register_output${NC}"
+        rm -rf "$work_dir"
         return 1
     fi
     echo -e " ${G}✓${NC}"
@@ -11631,21 +11808,27 @@ register_warp() {
     # 生成 WireGuard 配置
     echo -ne "  ${C}▸${NC} 生成 WireGuard 配置..."
     local generate_output
-    generate_output=$(/usr/local/bin/wgcf generate 2>&1)
+    generate_output=$(cd "$work_dir" && /usr/local/bin/wgcf generate 2>&1)
     local generate_ret=$?
     
-    if [[ $generate_ret -ne 0 ]] || [[ ! -f /tmp/wgcf-profile.conf ]]; then
+    if [[ $generate_ret -ne 0 ]] || [[ ! -f "$profile_file" ]]; then
         echo -e " ${R}✗${NC}"
         _err "配置生成失败"
         [[ -n "$generate_output" ]] && echo -e "  ${D}$generate_output${NC}"
+        rm -rf "$work_dir"
         return 1
     fi
     echo -e " ${G}✓${NC}"
     
     # 解析配置并保存到 JSON
     echo -ne "  ${C}▸${NC} 保存配置..."
-    parse_and_save_warp_config /tmp/wgcf-profile.conf
-    rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
+    if ! parse_and_save_warp_config "$profile_file"; then
+        rm -rf "$work_dir"
+        echo -e " ${R}✗${NC}"
+        _err "WARP 配置保存失败"
+        return 1
+    fi
+    rm -rf "$work_dir"
     echo -e " ${G}✓${NC}"
     
     # 显示配置信息
@@ -11727,7 +11910,7 @@ parse_and_save_warp_config() {
     local endpoint=$(grep "Endpoint" "$conf_file" | cut -d'=' -f2 | xargs)
     
     # 自动检测：纯 IPv6 服务器使用优选的 IPv6 端点
-    local has_ipv4=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
+    local has_ipv4=$(curl -4 -s --max-time 3 https://ifconfig.me/ip 2>/dev/null)
     if [[ -z "$has_ipv4" ]]; then
         # 无 IPv4，自动优选 WARP IPv6 端点
         local ep_port=$(echo "$endpoint" | grep -oE ':[0-9]+$' | tr -d ':')
@@ -11754,7 +11937,9 @@ parse_and_save_warp_config() {
     done
     
     mkdir -p "$CFG"
-    jq -n \
+    local tmp_warp
+    tmp_warp=$(mktemp "$CFG/.warp.json.tmp.XXXXXX") || return 1
+    if jq -n \
         --arg pk "$private_key" \
         --arg pub "$public_key" \
         --arg v4 "$address_v4" \
@@ -11767,7 +11952,13 @@ parse_and_save_warp_config() {
         address_v6: $v6,
         endpoint: $ep,
         reserved: [0, 0, 0]
-    }' > "$WARP_CONF_FILE"
+    }' > "$tmp_warp"; then
+        chmod 600 "$tmp_warp"
+        mv "$tmp_warp" "$WARP_CONF_FILE"
+    else
+        rm -f "$tmp_warp"
+        return 1
+    fi
 }
 
 # 生成 Xray WARP outbound 配置 (支持 WireGuard 和 SOCKS5 双模式)
@@ -16423,7 +16614,7 @@ create_load_balance_group() {
         }')
     
     # 保存到数据库
-    local tmp_file="${DB_FILE}.tmp"
+    local tmp_file; tmp_file=$(_db_new_tmp) || return 1
     if jq --argjson cfg "$lb_config" \
         '.balancer_groups = ((.balancer_groups // []) + [$cfg])' \
         "$DB_FILE" > "$tmp_file"; then
@@ -18835,7 +19026,7 @@ do_uninstall() {
     echo ""
     echo -e "  ${Y}已保留的内容:${NC}"
     echo -e "  • 软件包: xray, sing-box, snell-server"
-    echo -e "  • 软件包: anytls-server, shadow-tls, caddy"
+    echo -e "  • 软件包: shadow-tls, caddy（以及旧版遗留的 anytls-server）"
     echo -e "  • ${G}域名证书: 下次安装将自动复用，无需重新申请${NC}"
     echo ""
     echo -e "  ${C}如需完全删除软件包，请执行:${NC}"
@@ -19148,9 +19339,6 @@ do_install_server() {
         ss2022-shadowtls)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
-            ;;
-        anytls)
-            install_anytls || { _err "AnyTLS 安装失败"; _pause; return 1; }
             ;;
         naive)
             install_naive || { _err "NaïveProxy 安装失败"; _pause; return 1; }
@@ -19492,11 +19680,8 @@ do_install_server() {
                 [[ "$path" != /* ]] && path="/$path"
                 
                 # 检测是否为真实证书（用于决定是否显示订阅端口）
-                local _is_real_cert=false
-                if [[ -f "$CFG/certs/server.crt" ]]; then
-                    local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                    [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
-                fi
+                local has_real_cert=false
+                _is_real_cert && has_real_cert=true
                 
                 echo ""
                 _line
@@ -19510,7 +19695,7 @@ do_install_server() {
                 fi
                 echo -e "  UUID: ${G}${uuid:0:8}...${NC}"
                 echo -e "  SNI: ${G}$final_sni${NC}  Path: ${G}$path${NC}"
-                [[ -n "$cert_domain" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}${NGINX_PORT:-18443}${NC}"
+                [[ -n "$cert_domain" && "$has_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}${NGINX_PORT:-18443}${NC}"
                 _line
                 echo ""
                 read -rp "  确认安装? [Y/n]: " confirm
@@ -19637,13 +19822,10 @@ do_install_server() {
             _line
             echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
             # 检测是否为真实证书
-            local _is_real_cert=false
-            if [[ -f "$CFG/certs/server.crt" ]]; then
-                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
-            fi
+            local has_real_cert=false
+            _is_real_cert && has_real_cert=true
             echo -e "  SNI: ${G}$final_sni${NC}"
-            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
+            [[ -n "$CERT_DOMAIN" && "$has_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -19975,12 +20157,9 @@ do_install_server() {
             echo -e "  SNI: ${G}$final_sni${NC}"
             [[ "$use_ws" == "true" ]] && echo -e "  Path: ${G}$path${NC}"
             # 检测是否为真实证书
-            local _is_real_cert=false
-            if [[ -f "$CFG/certs/server.crt" ]]; then
-                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
-            fi
-            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
+            local has_real_cert=false
+            _is_real_cert && has_real_cert=true
+            [[ -n "$CERT_DOMAIN" && "$has_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -24326,15 +24505,15 @@ show_service_logs() {
         ((idx++))
     fi
     
-    # Sing-box 协议组 (hy2/tuic)
+    # Sing-box 协议组 (hy2/tuic/anytls)
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        echo -e "  ${G}$idx${NC}) Sing-box 服务日志 (hy2/tuic)"
+        echo -e "  ${G}$idx${NC}) Sing-box 服务日志 (hy2/tuic/anytls)"
         proto_array+=("singbox")
         ((idx++))
     fi
     
-    # 独立进程协议 (Snell/AnyTLS/ShadowTLS)
+    # 独立进程协议 (Snell/ShadowTLS/NaiveProxy)
     local standalone_protocols=$(get_standalone_protocols)
     for proto in $standalone_protocols; do
         local proto_name=$(get_protocol_name $proto)
@@ -24381,10 +24560,6 @@ show_service_logs() {
         snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
             service_name="vless-${selected}"
             proc_name="shadow-tls"
-            ;;
-        anytls)
-            service_name="vless-anytls"
-            proc_name="anytls-server"
             ;;
     esac
     
@@ -26790,7 +26965,18 @@ do_update() {
     fi
     local downloaded_ver
     downloaded_ver=$(_extract_script_version "$tmp_file")
-    if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$remote_ver" ]]; then
+    if [[ -z "$downloaded_ver" ]]; then
+        rm -f "$tmp_file"
+        _err "下载的脚本缺少有效版本号，已取消更新"
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if ! _version_gt "$downloaded_ver" "$VERSION"; then
+        rm -f "$tmp_file"
+        _err "下载版本 v${downloaded_ver} 不高于当前版本，已取消更新"
+        return 1
+    fi
+    if [[ "$downloaded_ver" != "$remote_ver" ]]; then
         remote_ver="$downloaded_ver"
         echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
     fi
@@ -26948,27 +27134,27 @@ main_menu() {
         local skip_pause=false
         if [[ -n "$installed" ]]; then
             case $choice in
-                1) do_install_server; skip_pause=true ;;
-                2) update_core_menu; skip_pause=true ;;
-                3) uninstall_specific_protocol; skip_pause=true ;;
-                4) manage_users; skip_pause=true ;;
+                1) _run_with_state_lock do_install_server; skip_pause=true ;;
+                2) _run_with_state_lock update_core_menu; skip_pause=true ;;
+                3) _run_with_state_lock uninstall_specific_protocol; skip_pause=true ;;
+                4) _run_with_state_lock manage_users; skip_pause=true ;;
                 5) show_all_protocols_info; skip_pause=true ;;
-                6) manage_subscription; skip_pause=true ;;
-                7) manage_protocol_services; skip_pause=true ;;
-                8) manage_routing; skip_pause=true ;;
-                9) manage_cloudflare_tunnel; skip_pause=true ;;
-                10) manage_port_forwarding; skip_pause=true ;;
-                11) enable_bbr; skip_pause=true ;;
+                6) _run_with_state_lock manage_subscription; skip_pause=true ;;
+                7) _run_with_state_lock manage_protocol_services; skip_pause=true ;;
+                8) _run_with_state_lock manage_routing; skip_pause=true ;;
+                9) _run_with_state_lock manage_cloudflare_tunnel; skip_pause=true ;;
+                10) _run_with_state_lock manage_port_forwarding; skip_pause=true ;;
+                11) _run_with_state_lock enable_bbr; skip_pause=true ;;
                 12) show_logs; skip_pause=true ;;
-                13) do_update ;;
-                14) do_uninstall ;;
+                13) _run_with_state_lock do_update ;;
+                14) _run_with_state_lock do_uninstall ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac
         else
             case $choice in
-                1) do_install_server; skip_pause=true ;;
-                12) do_update ;;
+                1) _run_with_state_lock do_install_server; skip_pause=true ;;
+                12) _run_with_state_lock do_update ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac
@@ -26982,8 +27168,8 @@ case "${1:-}" in
     --sync-traffic)
         # 静默模式：用于定时任务
         init_db
-        sync_all_user_traffic "true"
-        exit 0
+        _run_with_state_lock sync_all_user_traffic "true"
+        exit $?
         ;;
     --show-traffic)
         # 显示流量统计
@@ -26997,13 +27183,13 @@ case "${1:-}" in
         echo "检查用户到期状态..."
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始过期检查..." >> "$CFG/expire.log"
         # 发送即将过期提醒 (3天内)
-        warnings=$(send_expire_warnings 3)
+        warnings=$(_run_with_state_lock send_expire_warnings 3)
         echo "  发送 $warnings 条过期提醒" >> "$CFG/expire.log"
         # 禁用过期用户
         if [[ "${2:-}" == "--notify" ]]; then
-            disabled=$(check_and_disable_expired_users --notify)
+            disabled=$(_run_with_state_lock check_and_disable_expired_users --notify)
         else
-            disabled=$(check_and_disable_expired_users)
+            disabled=$(_run_with_state_lock check_and_disable_expired_users)
         fi
         echo "  禁用 $disabled 个过期用户" >> "$CFG/expire.log"
         # 输出结果到终端
