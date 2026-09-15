@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # 在已安装过脚本的 Linux 服务器上以 root 执行：从 GitHub main 拉取最新 vless-server.sh，
 # 覆盖 /usr/local/bin/vless-server.sh，并重建 ml 快捷方式（修复菜单 stdin 等需依赖线上最新文件）。
-# 用法: curl -fsSL https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/tools/upgrade-from-github.sh | bash
+# 用法: curl -fsSL https://raw.githubusercontent.com/charmtv/vless-all-in/main/tools/upgrade-from-github.sh | bash
 #   或: bash upgrade-from-github.sh
 set -euo pipefail
 
 [[ "${EUID:-0}" -eq 0 ]] || { echo "请使用 root 执行: sudo bash $0"; exit 1; }
 
-readonly RAW_BASE="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main"
+readonly RAW_BASE="https://raw.githubusercontent.com/charmtv/vless-all-in/main"
 readonly TARGET="/usr/local/bin/vless-server.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT

@@ -22,7 +22,7 @@
 ## 快速安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/charmtv/vless-all-in/main/install.sh | bash
 ```
 
 安装器会下载 `vless-server.sh` 和仓库中的 `SHA256SUMS`，校验通过并完成 Bash 语法检查后才执行。
@@ -30,8 +30,8 @@ curl -fsSL https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/insta
 也可以手动运行：
 
 ```bash
-wget -O vless-server.sh https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/vless-server.sh
-wget -O SHA256SUMS https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/SHA256SUMS
+wget -O vless-server.sh https://raw.githubusercontent.com/charmtv/vless-all-in/main/vless-server.sh
+wget -O SHA256SUMS https://raw.githubusercontent.com/charmtv/vless-all-in/main/SHA256SUMS
 sha256sum -c SHA256SUMS
 chmod +x vless-server.sh
 sudo ./vless-server.sh
@@ -52,7 +52,7 @@ sudo ml
 也可以执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/tools/upgrade-from-github.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/charmtv/vless-all-in/main/tools/upgrade-from-github.sh | sudo bash
 ```
 
 如需手动回滚：

@@ -37,5 +37,5 @@ for ($i = 1; $i -le $maxAttempts; $i++) {
     Start-Sleep -Seconds $delaySec
 }
 
-Write-Host "[push] giving up. Try VPN or: git remote set-url origin git@github.com:charmtv/mlnbvless-all-in.git"
+Write-Host "[push] giving up. Try VPN or: git remote set-url origin git@github.com:charmtv/vless-all-in.git"
 exit 1

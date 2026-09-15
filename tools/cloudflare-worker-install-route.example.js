@@ -5,7 +5,7 @@
  * 原因：用户执行 curl https://你的域名/install.sh | bash 时，若跳到 vless-server.sh，
  * bash 会把整份主脚本从管道读入，install.sh 里的「exec … </dev/tty」不会执行，菜单会异常。
  *
- * 正确 raw：https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/install.sh
+ * 正确 raw：https://raw.githubusercontent.com/charmtv/vless-all-in/main/install.sh
  */
 export default {
   async fetch(request) {
@@ -14,14 +14,14 @@ export default {
 
     if (path === "" || path === "/") {
       return Response.redirect(
-        "https://github.com/charmtv/mlnbvless-all-in",
+        "https://github.com/charmtv/vless-all-in",
         302
       );
     }
 
     if (path.toLowerCase() === "/install.sh") {
       return Response.redirect(
-        "https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/install.sh",
+        "https://raw.githubusercontent.com/charmtv/vless-all-in/main/install.sh",
         302
       );
     }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 一键下载并执行主脚本（与仓库 main 分支 vless-server.sh 一致）
-# 用法: curl -fsSL https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/install.sh | bash
+# 用法: curl -fsSL https://raw.githubusercontent.com/charmtv/vless-all-in/main/install.sh | bash
 set -euo pipefail
-readonly RAW_BASE="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main"
+readonly RAW_BASE="https://raw.githubusercontent.com/charmtv/vless-all-in/main"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 

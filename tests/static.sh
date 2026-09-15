@@ -32,6 +32,12 @@ if grep -Fq 'http://ip-api.com' vless-server.sh; then
 fi
 grep -Fq 'SCRIPT_CHECKSUM_URL=' vless-server.sh
 
+old_repo_name='mlnbvless''-all-in'
+if grep -RFn --exclude-dir=.git "$old_repo_name" .; then
+  echo "仓库中不应再保留旧项目名" >&2
+  exit 1
+fi
+
 expected="$(awk '$2 == "vless-server.sh" || $2 == "*vless-server.sh" {print $1; exit}' SHA256SUMS)"
 actual="$(sha256sum vless-server.sh | awk '{print $1}')"
 [[ -n "$expected" && "$actual" == "$expected" ]] || {

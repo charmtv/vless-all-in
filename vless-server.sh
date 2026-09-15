@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.0 [服务端]
+#  多协议代理一键部署脚本 v3.6.1 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -14,11 +14,11 @@
 #  
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.0"
+readonly VERSION="3.6.1"
 readonly SHORTCUT_CMD="ml"
-readonly SCRIPT_REPO="charmtv/mlnbvless-all-in"
-readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/vless-server.sh"
-readonly SCRIPT_CHECKSUM_URL="https://raw.githubusercontent.com/charmtv/mlnbvless-all-in/main/SHA256SUMS"
+readonly SCRIPT_REPO="charmtv/vless-all-in"
+readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/charmtv/vless-all-in/main/vless-server.sh"
+readonly SCRIPT_CHECKSUM_URL="https://raw.githubusercontent.com/charmtv/vless-all-in/main/SHA256SUMS"
 readonly CFG="/etc/vless-reality"
 readonly ACME_DEFAULT_EMAIL="${ACME_EMAIL:-}"
 
